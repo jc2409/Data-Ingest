@@ -1,0 +1,17 @@
+[project]
+name = "data-ingest"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "boto3>=1.41.0",
+    "datasets>=4.4.1",
+    "numpy>=2.0.0",
+    "openai>=2.8.1",
+    "python-dotenv>=1.2.1",
+    "structured>=0.1",
+    "tiktoken>=0.12.0",
+    "tqdm>=4.67.1",
+    "unstructured-client>=0.42.4",
+]
