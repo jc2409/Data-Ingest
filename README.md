@@ -318,10 +318,6 @@ chunker.process_document(
 - [Azure OpenAI Embeddings](https://learn.microsoft.com/en-us/azure/ai-services/openai/concepts/embeddings)
 - [AWS Bedrock Claude](https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-anthropic-claude.html)
 
-## License
-
-[Your License Here]
-
 ## Support
 
 For issues and questions:
