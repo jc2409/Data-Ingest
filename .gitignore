@@ -13,3 +13,4 @@ wheels/
 dataset/src/*
 dataset/chunks/*
 dataset/res/*
+dataset/tmp/

@@ -1,8 +1,8 @@
+import sys, getopt
 import json
 import os
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
-from openai import AzureOpenAI
 import boto3
 from botocore.exceptions import ClientError
 import tiktoken
@@ -10,6 +10,8 @@ import numpy as np
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
+import re
+from html.parser import HTMLParser
 
 load_dotenv()
 
@@ -35,7 +37,7 @@ class Chunk:
 class ContextualChunker:
     """
     Implements semantic chunking strategy:
-    - Embedding-based semantic grouping using text-embedding-3-large (Azure OpenAI)
+    - Embedding-based semantic grouping using Amazon Titan Embed Text v2
     - Automatic topic boundary detection via cosine similarity
     - LLM-enhanced context generation using Claude on AWS Bedrock
     - Rich metadata preservation
@@ -43,31 +45,29 @@ class ContextualChunker:
 
     def __init__(
         self,
-        azure_endpoint: str,
-        azure_api_key: str,
-        api_version: str = "2025-01-01-preview",
-        embedding_model: str = "text-embedding-3-large",
         aws_region: str = "us-east-1",
-        claude_model: str = "arn:aws:bedrock:us-east-1:522946686627:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0",
-        similarity_threshold: float = 0.75,
-        min_chunk_size: int = 400,
-        max_chunk_size: int = 1200,
+        claude_model: str = os.getenv("AWS_BEDROCK_CLAUDE_MODEL"),
+        vision_model: str = os.getenv("AWS_BEDROCK_VISION_MODEL"), 
+        embedding_model: str = os.getenv("AWS_BEDROCK_TITAN_EMBEDDING_MODEL"),
+        embedding_dimensions: int = 1024,
+        normalize_embeddings: bool = True,
+        similarity_threshold: float = 0.70,
+        min_chunk_size: int = 300,
+        max_chunk_size: int = 1000,
         max_workers: int = 5
     ):
-        # Azure OpenAI client for embeddings
-        self.azure_client = AzureOpenAI(
-            azure_endpoint=azure_endpoint,
-            api_key=azure_api_key,
-            api_version=api_version
-        )
-        self.embedding_model = embedding_model
-
-        # AWS Bedrock client for Claude chat completions
+        # AWS Bedrock client for both embeddings and Claude
         self.bedrock_client = boto3.client(
             service_name="bedrock-runtime",
             region_name=aws_region
         )
-        self.claude_model = claude_model
+        self.claude_model = claude_model  # Used for context generation (can be Haiku)
+        # Vision model for image descriptions (must support vision, e.g., Sonnet)
+        # Default to Sonnet if not specified
+        self.vision_model = vision_model 
+        self.embedding_model = embedding_model
+        self.embedding_dimensions = embedding_dimensions
+        self.normalize_embeddings = normalize_embeddings
 
         self.similarity_threshold = similarity_threshold
         self.min_chunk_size = min_chunk_size
@@ -83,7 +83,7 @@ class ContextualChunker:
 
     def get_embedding(self, text: str) -> np.ndarray:
         """
-        Generate embedding for text using Azure OpenAI text-embedding-3-large
+        Generate embedding for text using Amazon Titan Embed Text v2
 
         Args:
             text: Text to embed
@@ -92,15 +92,30 @@ class ContextualChunker:
             numpy array of embedding vector
         """
         try:
-            response = self.azure_client.embeddings.create(
-                model=self.embedding_model,
-                input=text
+            # Prepare request body for Titan v2
+            request_body = {
+                "inputText": text,
+                "dimensions": self.embedding_dimensions,
+                "normalize": self.normalize_embeddings
+            }
+
+            # Invoke Titan embedding model
+            response = self.bedrock_client.invoke_model(
+                modelId=self.embedding_model,
+                body=json.dumps(request_body),
+                contentType="application/json",
+                accept="application/json"
             )
-            return np.array(response.data[0].embedding)
+
+            # Parse response
+            response_body = json.loads(response['body'].read())
+            embedding = response_body.get('embedding', [])
+
+            return np.array(embedding)
         except Exception as e:
             print(f"Error generating embedding: {e}")
             # Return zero vector as fallback
-            return np.zeros(3072)  # text-embedding-3-large dimension
+            return np.zeros(self.embedding_dimensions)
 
     def cosine_similarity(self, vec1: np.ndarray, vec2: np.ndarray) -> float:
         """
@@ -131,6 +146,224 @@ class ContextualChunker:
         with open(json_path, 'r') as f:
             return json.load(f)
 
+    def _process_image_element(self, element: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Process a single image element by generating its description.
+        Returns the modified element or None if invalid.
+        """
+        image_base64 = element.get("metadata", {}).get("image_base64")
+        if not image_base64:
+            return None
+
+        filetype = element.get("metadata", {}).get("filetype", "png")
+
+        # Map file extensions to Claude-supported media types
+        media_type_map = {
+            "jpg": "image/jpeg",
+            "jpeg": "image/jpeg",
+            "png": "image/png",
+            "gif": "image/gif",
+            "webp": "image/webp",
+            "image/jpg": "image/jpeg",
+            "image/jpeg": "image/jpeg",
+            "image/png": "image/png",
+            "image/gif": "image/gif",
+            "image/webp": "image/webp"
+        }
+
+        filetype_lower = filetype.lower().strip()
+        media_type = media_type_map.get(filetype_lower, "image/png")
+
+        description = self.generate_image_description(image_base64, media_type)
+
+        element["text"] = f"[IMAGE] {description}"
+        element["metadata"]["image_description"] = description
+        element["metadata"]["has_image"] = True
+        return element
+
+    def _process_elements_concurrently(self, elements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Process elements concurrently: images in parallel, text immediately.
+
+        Strategy:
+        - Submit all images to thread pool for concurrent processing
+        - Process text elements immediately (no API calls needed)
+        - Wait for image descriptions to complete
+        - Return all valid elements in original order
+        """
+        print("  Processing elements (generating image descriptions concurrently)...")
+
+        # Separate images and text, preserving order
+        image_indices = []
+        image_elements = []
+        text_elements = []
+        element_order = []  # Track original positions
+
+        for idx, element in enumerate(elements):
+            element_type = element.get("type", "")
+
+            if element_type == "Image":
+                image_base64 = element.get("metadata", {}).get("image_base64")
+                if image_base64:
+                    image_indices.append(idx)
+                    image_elements.append(element)
+                    element_order.append(('image', len(image_elements) - 1))
+            elif element.get("text", "").strip():
+                text_elements.append(element)
+                element_order.append(('text', len(text_elements) - 1))
+
+        # Process images concurrently
+        processed_images = [None] * len(image_elements)
+        if image_elements:
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                future_to_idx = {
+                    executor.submit(self._process_image_element, img): i
+                    for i, img in enumerate(image_elements)
+                }
+
+                with tqdm(total=len(image_elements), desc="  Processing images", leave=False) as pbar:
+                    for future in as_completed(future_to_idx):
+                        idx = future_to_idx[future]
+                        processed_images[idx] = future.result()
+                        pbar.update(1)
+
+        # Reconstruct elements in original order
+        valid_elements = []
+        for element_type, idx in element_order:
+            if element_type == 'image':
+                if processed_images[idx] is not None:
+                    valid_elements.append(processed_images[idx])
+            else:  # text
+                valid_elements.append(text_elements[idx])
+
+        return valid_elements
+
+    def group_elements_by_size(
+        self,
+        elements: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Group elements using size-based chunking with natural boundaries.
+
+        Strategy:
+        - Use Titles as section boundaries
+        - Keep Tables and Images as separate chunks
+        - Group text elements until reaching target size
+        - Respect natural document structure
+        """
+        # Process elements: generate descriptions for images (concurrently), filter empty text elements
+        valid_elements = self._process_elements_concurrently(elements)
+
+        if not valid_elements:
+            return []
+
+        print("  Grouping elements by size...")
+
+        chunks = []
+        current_chunk = {
+            "elements": [],
+            "tokens": 0,
+            "metadata": {}
+        }
+        current_section_title = None
+
+        for element in tqdm(valid_elements, desc="  Creating chunks", leave=False):
+            element_type = element.get("type", "")
+            element_text = element.get("text", "")
+            element_tokens = self.count_tokens(element_text)
+
+            metadata = element.get("metadata", {})
+            page_number = metadata.get("page_number")
+
+            # Track section titles for context
+            if element_type == "Title":
+                current_section_title = element_text
+
+                # If we have a substantial chunk before this title, save it
+                if current_chunk["elements"] and current_chunk["tokens"] >= self.min_chunk_size:
+                    chunks.append(self._finalize_chunk(current_chunk))
+                    current_chunk = {"elements": [], "tokens": 0, "metadata": {}}
+
+            # Images should be their own chunks
+            if element_type == "Image":
+                # Finish current chunk if it exists
+                if current_chunk["elements"]:
+                    chunks.append(self._finalize_chunk(current_chunk))
+                    current_chunk = {"elements": [], "tokens": 0, "metadata": {}}
+
+                # Add image as standalone chunk
+                image_metadata = {
+                    "section_title": current_section_title,
+                    "page_number": page_number,
+                    "chunk_type": "image",
+                    "has_image": True,
+                    "image_base64": metadata.get("image_base64"),
+                    "image_description": metadata.get("image_description"),
+                    "filetype": metadata.get("filetype")
+                }
+
+                chunks.append({
+                    "elements": [element],
+                    "tokens": element_tokens,
+                    "metadata": image_metadata
+                })
+                continue
+
+            # Tables should be their own chunks
+            if element_type == "Table":
+                # Finish current chunk if it exists
+                if current_chunk["elements"]:
+                    chunks.append(self._finalize_chunk(current_chunk))
+                    current_chunk = {"elements": [], "tokens": 0, "metadata": {}}
+
+                # Add table as standalone chunk
+                chunks.append({
+                    "elements": [element],
+                    "tokens": element_tokens,
+                    "metadata": {
+                        "section_title": current_section_title,
+                        "page_number": page_number,
+                        "chunk_type": "table"
+                    }
+                })
+                continue
+
+            # Determine if we should start a new chunk
+            should_split = False
+
+            # Split if adding this element would exceed max size
+            if current_chunk["elements"] and current_chunk["tokens"] + element_tokens > self.max_chunk_size:
+                # Only split if current chunk meets minimum size
+                if current_chunk["tokens"] >= self.min_chunk_size:
+                    should_split = True
+
+            if should_split:
+                chunks.append(self._finalize_chunk(current_chunk))
+                current_chunk = {
+                    "elements": [element],
+                    "tokens": element_tokens,
+                    "metadata": {
+                        "section_title": current_section_title,
+                        "page_number": page_number
+                    }
+                }
+            else:
+                # Add to current chunk
+                current_chunk["elements"].append(element)
+                current_chunk["tokens"] += element_tokens
+
+                if not current_chunk["metadata"]:
+                    current_chunk["metadata"] = {
+                        "section_title": current_section_title,
+                        "page_number": page_number
+                    }
+
+        # Add final chunk if it has content
+        if current_chunk["elements"]:
+            chunks.append(self._finalize_chunk(current_chunk))
+
+        return chunks
+
     def group_elements_semantically(
         self,
         elements: List[Dict[str, Any]]
@@ -139,57 +372,14 @@ class ContextualChunker:
         Group elements using semantic similarity with embeddings.
 
         Strategy:
-        - Generate embeddings for each element using text-embedding-3-large
+        - Generate embeddings for each element using Amazon Titan Embed Text v2
         - Calculate cosine similarity between consecutive elements
         - Create chunk boundaries when similarity drops below threshold
         - Keep tables as separate chunks (self-contained units)
         - Respect min/max chunk size constraints
         """
-        # Process elements: generate descriptions for images, filter empty text elements
-        valid_elements = []
-        print("  Processing elements (generating image descriptions if present)...")
-
-        for element in tqdm(elements, desc="  Processing elements", leave=False):
-            element_type = element.get("type", "")
-
-            # Handle Image elements - generate descriptions
-            if element_type == "Image":
-                # Get base64 image data
-                image_base64 = element.get("metadata", {}).get("image_base64")
-                if image_base64:
-                    # Get media type from metadata and normalize to supported formats
-                    filetype = element.get("metadata", {}).get("filetype", "png")
-
-                    # Map file extensions to Claude-supported media types
-                    media_type_map = {
-                        "jpg": "image/jpeg",
-                        "jpeg": "image/jpeg",
-                        "png": "image/png",
-                        "gif": "image/gif",
-                        "webp": "image/webp",
-                        "image/jpg": "image/jpeg",
-                        "image/jpeg": "image/jpeg",
-                        "image/png": "image/png",
-                        "image/gif": "image/gif",
-                        "image/webp": "image/webp"
-                    }
-
-                    # Normalize and map to supported format
-                    filetype_lower = filetype.lower().strip()
-                    media_type = media_type_map.get(filetype_lower, "image/png")  # Default to PNG
-
-                    # Generate description using Claude Vision
-                    description = self.generate_image_description(image_base64, media_type)
-
-                    # Add description as text so it can be embedded and chunked
-                    element["text"] = f"[IMAGE] {description}"
-                    element["metadata"]["image_description"] = description
-                    element["metadata"]["has_image"] = True
-                    valid_elements.append(element)
-
-            # Handle text elements - only keep if they have content
-            elif element.get("text", "").strip():
-                valid_elements.append(element)
+        # Process elements: generate descriptions for images (concurrently), filter empty text elements
+        valid_elements = self._process_elements_concurrently(elements)
 
         if not valid_elements:
             return []
@@ -332,21 +522,107 @@ class ContextualChunker:
 
     def _finalize_chunk(self, chunk: Dict[str, Any]) -> Dict[str, Any]:
         """Remove embedding from chunk before returning (not needed in output)"""
+        # Ensure metadata has chunk_type and has_image set
+        if "chunk_type" not in chunk["metadata"]:
+            chunk["metadata"]["chunk_type"] = "text"
+        if "has_image" not in chunk["metadata"]:
+            chunk["metadata"]["has_image"] = False
+
         return {
             "elements": chunk["elements"],
             "tokens": chunk["tokens"],
             "metadata": chunk["metadata"]
         }
 
+    def html_table_to_markdown(self, html: str) -> str:
+        """
+        Convert HTML table to Markdown format for better embedding quality
+
+        Args:
+            html: HTML table string
+
+        Returns:
+            Markdown formatted table
+        """
+        try:
+            # Remove HTML tags but keep structure
+            # Simple approach: extract cell contents and format as markdown
+
+            # Extract all table cells
+            rows = []
+
+            # Find all <tr> elements
+            tr_pattern = re.compile(r'<tr[^>]*>(.*?)</tr>', re.DOTALL | re.IGNORECASE)
+            tr_matches = tr_pattern.findall(html)
+
+            for tr_content in tr_matches:
+                # Find all <td> or <th> elements in this row
+                cell_pattern = re.compile(r'<t[dh][^>]*>(.*?)</t[dh]>', re.DOTALL | re.IGNORECASE)
+                cells = cell_pattern.findall(tr_content)
+
+                # Clean cell content (remove nested tags, normalize whitespace)
+                cleaned_cells = []
+                for cell in cells:
+                    # Remove HTML tags
+                    clean = re.sub(r'<[^>]+>', '', cell)
+                    # Normalize whitespace
+                    clean = ' '.join(clean.split())
+                    # Unescape HTML entities
+                    clean = clean.replace('&nbsp;', ' ').replace('&amp;', '&')
+                    cleaned_cells.append(clean)
+
+                if cleaned_cells:
+                    rows.append(cleaned_cells)
+
+            if not rows:
+                # Fallback: just remove all HTML tags
+                clean = re.sub(r'<[^>]+>', ' ', html)
+                return ' '.join(clean.split())
+
+            # Build markdown table
+            markdown_lines = []
+
+            # Determine column count
+            max_cols = max(len(row) for row in rows) if rows else 0
+
+            if max_cols == 0:
+                return ' '.join(' '.join(row) for row in rows)
+
+            # First row as header
+            if rows:
+                header = rows[0]
+                # Pad header if needed
+                while len(header) < max_cols:
+                    header.append('')
+                markdown_lines.append('| ' + ' | '.join(header) + ' |')
+                markdown_lines.append('| ' + ' | '.join(['---'] * max_cols) + ' |')
+
+                # Remaining rows
+                for row in rows[1:]:
+                    # Pad row if needed
+                    while len(row) < max_cols:
+                        row.append('')
+                    markdown_lines.append('| ' + ' | '.join(row) + ' |')
+
+            return '\n'.join(markdown_lines)
+
+        except Exception as e:
+            print(f"Error converting HTML to markdown: {e}")
+            # Fallback: strip all HTML tags
+            clean = re.sub(r'<[^>]+>', ' ', html)
+            return ' '.join(clean.split())
+
     def combine_chunk_text(self, chunk: Dict[str, Any]) -> str:
-        """Combine elements into a single text string, using HTML for tables when available"""
+        """Combine elements into a single text string, converting HTML tables to Markdown"""
         texts = []
         for e in chunk["elements"]:
-            # For tables, prefer HTML representation if available for better structure preservation
+            # For tables, convert HTML to Markdown for better embedding quality
             if e.get("type") == "Table":
                 html_text = e.get("metadata", {}).get("text_as_html")
                 if html_text:
-                    texts.append(html_text)
+                    # Convert HTML table to Markdown
+                    markdown_table = self.html_table_to_markdown(html_text)
+                    texts.append(markdown_table)
                 else:
                     # Fall back to plain text if HTML not available
                     texts.append(e.get("text", ""))
@@ -360,15 +636,17 @@ class ContextualChunker:
         Create full document text from all elements for Anthropic's contextual retrieval.
 
         Combines all element texts into a single document string that will be used
-        as context when generating chunk summaries. Uses HTML for tables when available.
+        as context when generating chunk summaries. Uses Markdown for tables for better LLM understanding.
         """
         texts = []
         for element in elements:
-            # For tables, prefer HTML representation for better structure
+            # For tables, convert HTML to Markdown for better structure and readability
             if element.get("type") == "Table":
                 html_text = element.get("metadata", {}).get("text_as_html")
                 if html_text and html_text.strip():
-                    texts.append(html_text)
+                    # Convert HTML table to Markdown
+                    markdown_table = self.html_table_to_markdown(html_text)
+                    texts.append(markdown_table)
                 else:
                     text = element.get("text", "").strip()
                     if text:
@@ -483,9 +761,9 @@ Please give a short succinct context to situate this chunk within the overall do
                 ]
             }
 
-            # Invoke Claude Vision model on Bedrock
+            # Invoke Claude Vision model on Bedrock (use vision_model which supports images)
             response = self.bedrock_client.invoke_model(
-                modelId=self.claude_model,
+                modelId=self.vision_model,
                 body=json.dumps(native_request)
             )
 
@@ -554,7 +832,8 @@ Please give a short succinct context to situate this chunk within the overall do
         json_path: str,
         output_path: str,
         use_llm_context: bool = True,
-        parallel: bool = True
+        parallel: bool = True,
+        chunking_strategy: str = "size"
     ) -> List[Chunk]:
         """
         Process a single document through the full chunking pipeline.
@@ -564,6 +843,7 @@ Please give a short succinct context to situate this chunk within the overall do
             output_path: Where to save chunked output
             use_llm_context: Whether to use LLM for context generation
             parallel: Whether to process chunks in parallel (faster for LLM context)
+            chunking_strategy: Chunking method to use ("size" or "semantic")
 
         Returns:
             List of Chunk objects
@@ -576,8 +856,13 @@ Please give a short succinct context to situate this chunk within the overall do
         # Create full document text for Anthropic's contextual retrieval method
         full_document_text = self._create_full_document_text(elements)
 
-        # Group semantically
-        grouped_chunks = self.group_elements_semantically(elements)
+        # Group elements based on selected strategy
+        if chunking_strategy == "semantic":
+            grouped_chunks = self.group_elements_semantically(elements)
+        elif chunking_strategy == "size":
+            grouped_chunks = self.group_elements_by_size(elements)
+        else:
+            raise ValueError(f"Unknown chunking_strategy: {chunking_strategy}. Use 'size' or 'semantic'.")
 
         # Get document name
         document_name = os.path.basename(json_path).replace(".json", "")
@@ -631,7 +916,8 @@ Please give a short succinct context to situate this chunk within the overall do
         input_dir: str,
         output_dir: str,
         use_llm_context: bool = True,
-        parallel: bool = True
+        parallel: bool = True,
+        chunking_strategy: str = "size"
     ):
         """
         Process all JSON documents in a directory.
@@ -641,6 +927,7 @@ Please give a short succinct context to situate this chunk within the overall do
             output_dir: Directory to save chunked outputs
             use_llm_context: Whether to use LLM for context generation
             parallel: Whether to use parallel processing
+            chunking_strategy: Chunking method to use ("size" or "semantic")
         """
         os.makedirs(output_dir, exist_ok=True)
 
@@ -653,7 +940,7 @@ Please give a short succinct context to situate this chunk within the overall do
             output_path = os.path.join(output_dir, json_file.replace('.json', '_chunks.json'))
 
             try:
-                self.process_document(input_path, output_path, use_llm_context, parallel)
+                self.process_document(input_path, output_path, use_llm_context, parallel, chunking_strategy)
             except Exception as e:
                 print(f"Error processing {json_file}: {e}")
 
@@ -662,24 +949,68 @@ Please give a short succinct context to situate this chunk within the overall do
 
 if __name__ == "__main__":
 
-    # Initialize chunker with semantic chunking using Azure embeddings and AWS Bedrock Claude
+    # Initialize chunker using Amazon Titan embeddings and AWS Bedrock Claude
     chunker = ContextualChunker(
-        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-        azure_api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-        api_version="2025-01-01-preview",
-        embedding_model="text-embedding-3-large",  # Azure OpenAI embeddings for semantic chunking
-        aws_region=os.getenv("AWS_DEFAULT_REGION", "us-east-1"),  # AWS region for Bedrock
-        claude_model=os.getenv("AWS_BEDROCK_CLAUDE_MODEL"),  # Claude model ARN from .env
-        similarity_threshold=0.75,  # Cosine similarity threshold for topic boundaries
-        min_chunk_size=400,  # Minimum chunk size in tokens
-        max_chunk_size=1200,  # Maximum chunk size in tokens
-        max_workers=2  # Sequential processing to avoid Bedrock rate limits
+        aws_region=os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
+        claude_model=os.getenv("AWS_BEDROCK_CLAUDE_MODEL"),
+        vision_model=os.getenv("AWS_BEDROCK_VISION_MODEL"),
+        embedding_model=os.getenv("AWS_BEDROCK_TITAN_EMBEDDING_MODEL"),
+        embedding_dimensions=1024,
+        normalize_embeddings=True,
+        similarity_threshold=0.70,
+        min_chunk_size=400,
+        max_chunk_size=800,
+        max_workers=3
     )
 
-    # Process all documents
-    chunker.process_all_documents(
-        input_dir=os.getcwd() + "/dataset/res",
-        output_dir=os.getcwd() + "/dataset/chunks",
-        use_llm_context=True,  # Set to False for faster processing without LLM context
-        parallel=True  # Use parallel processing for speed
-    )
+    args = sys.argv[1:]
+    options = "hsmc:"
+    long_options = ["Help", "Single", "Multiple", "Chunking="]
+
+    # Default chunking strategy
+    chunking_strategy = "size"
+
+    try:
+        arguments, values = getopt.getopt(args, options, long_options)
+
+        # Parse chunking strategy first
+        for currentArg, currentVal in arguments:
+            if currentArg in ("-c", "--Chunking"):
+                chunking_strategy = currentVal
+                if chunking_strategy not in ["size", "semantic"]:
+                    print(f"Error: Invalid chunking strategy '{chunking_strategy}'. Use 'size' or 'semantic'.")
+                    sys.exit(1)
+
+        for currentArg, currentVal in arguments:
+            if currentArg in ("-h", "--Help"):
+                print("Usage: python contextual_chunking.py [options]")
+                print("Options:")
+                print("  -h, --Help                Show this help message")
+                print("  -s, --Single FILE         Process a single document")
+                print("  -m, --Multiple            Process all documents in /dataset/res/")
+                print("  -c, --Chunking STRATEGY   Chunking strategy: 'size' or 'semantic' (default: size)")
+
+            elif currentArg in ("-s", "--Single"):
+                print(f"Single Document Processing mode (chunking: {chunking_strategy})")
+
+                # Process single document
+                chunker.process_document(
+                    json_path=os.getcwd() + "/" + args[-1],
+                    output_path=os.getcwd() + "/" + args[-1].replace("/res/", "/chunks/").replace(".json", "_chunks.json"),
+                    use_llm_context=True,
+                    parallel=True,
+                    chunking_strategy=chunking_strategy
+                )
+            elif currentArg in ("-m", "--Multiple"):
+                print(f"Multiple Document Processing mode (chunking: {chunking_strategy})")
+
+                # Process all documents
+                chunker.process_all_documents(
+                    input_dir=os.getcwd() + "/dataset/res",
+                    output_dir=os.getcwd() + "/dataset/chunks",
+                    use_llm_context=True,
+                    parallel=True,
+                    chunking_strategy=chunking_strategy
+                )
+    except getopt.error as err:
+        print(str(err))
