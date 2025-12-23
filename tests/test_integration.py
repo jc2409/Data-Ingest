@@ -168,7 +168,7 @@ class TestChunkingIntegration:
                 output_path=output_path,
                 use_llm_context=False,  # Set to True to test Claude context generation
                 parallel=False,
-                chunking_strategy="size"
+                chunking_strategy="basic"
             )
 
             print(f"\n  Created {len(chunks)} chunks")

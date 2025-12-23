@@ -1,79 +1,278 @@
 """
-Retrieval examples with metadata filtering
-Demonstrates various filtered search patterns
+Advanced retrieval with metadata filtering and quality improvements.
+
+Features:
+- Basic filtered search
+- Hybrid search (semantic + BM25)
+- LLM reranking
+- HyDE (Hypothetical Document Embeddings)
+- Query expansion
 """
+import json
+import math
 import os
-from typing import List, Dict, Any, Optional
-from .indexing import PineconeIndexer
+import re
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+import boto3
 from dotenv import load_dotenv
+
+from .indexing import PineconeIndexer
 
 load_dotenv()
 
 
+@dataclass
+class RetrievalResult:
+    """Represents a single retrieval result with score and metadata."""
+    chunk_id: str
+    score: float
+    content: str
+    metadata: Dict[str, Any]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "chunk_id": self.chunk_id,
+            "score": self.score,
+            "content": self.content,
+            "metadata": self.metadata
+        }
+
+
+class BM25:
+    """
+    BM25 ranking algorithm for keyword-based retrieval.
+
+    BM25 is a bag-of-words retrieval function that ranks documents
+    based on query term frequency and inverse document frequency.
+    """
+
+    def __init__(self, k1: float = 1.5, b: float = 0.75):
+        """
+        Initialize BM25 with tuning parameters.
+
+        Args:
+            k1: Term frequency saturation parameter (1.2-2.0 typical)
+            b: Document length normalization (0.75 typical)
+        """
+        self.k1 = k1
+        self.b = b
+        self.doc_lengths: Dict[str, int] = {}
+        self.avg_doc_length: float = 0
+        self.doc_freqs: Dict[str, int] = defaultdict(int)
+        self.term_freqs: Dict[str, Dict[str, int]] = {}
+        self.num_docs: int = 0
+        self.documents: Dict[str, str] = {}
+
+    def _tokenize(self, text: str) -> List[str]:
+        """Simple tokenization: lowercase, split on non-alphanumeric."""
+        text = text.lower()
+        tokens = re.findall(r'\b\w+\b', text)
+        return tokens
+
+    def index_documents(self, documents: Dict[str, str]):
+        """
+        Index documents for BM25 retrieval.
+
+        Args:
+            documents: Dictionary mapping doc_id to content
+        """
+        self.documents = documents
+        self.num_docs = len(documents)
+        total_length = 0
+
+        for doc_id, content in documents.items():
+            tokens = self._tokenize(content)
+            self.doc_lengths[doc_id] = len(tokens)
+            total_length += len(tokens)
+
+            # Count term frequencies in this document
+            term_freq: Dict[str, int] = defaultdict(int)
+            for token in tokens:
+                term_freq[token] += 1
+            self.term_freqs[doc_id] = dict(term_freq)
+
+            # Count document frequencies
+            for token in set(tokens):
+                self.doc_freqs[token] += 1
+
+        self.avg_doc_length = total_length / self.num_docs if self.num_docs > 0 else 0
+
+    def _idf(self, term: str) -> float:
+        """Calculate inverse document frequency for a term."""
+        df = self.doc_freqs.get(term, 0)
+        if df == 0:
+            return 0
+        return math.log((self.num_docs - df + 0.5) / (df + 0.5) + 1)
+
+    def score(self, query: str, doc_id: str) -> float:
+        """
+        Calculate BM25 score for a query-document pair.
+
+        Args:
+            query: Search query
+            doc_id: Document identifier
+
+        Returns:
+            BM25 score (higher is better)
+        """
+        query_tokens = self._tokenize(query)
+        doc_length = self.doc_lengths.get(doc_id, 0)
+        term_freqs = self.term_freqs.get(doc_id, {})
+
+        score = 0.0
+        for term in query_tokens:
+            if term not in term_freqs:
+                continue
+
+            tf = term_freqs[term]
+            idf = self._idf(term)
+
+            # BM25 formula
+            numerator = tf * (self.k1 + 1)
+            denominator = tf + self.k1 * (1 - self.b + self.b * doc_length / self.avg_doc_length)
+            score += idf * (numerator / denominator)
+
+        return score
+
+    def search(self, query: str, top_k: int = 10) -> List[Tuple[str, float]]:
+        """
+        Search indexed documents with BM25.
+
+        Args:
+            query: Search query
+            top_k: Number of results to return
+
+        Returns:
+            List of (doc_id, score) tuples sorted by score descending
+        """
+        scores = []
+        for doc_id in self.documents:
+            score = self.score(query, doc_id)
+            if score > 0:
+                scores.append((doc_id, score))
+
+        scores.sort(key=lambda x: x[1], reverse=True)
+        return scores[:top_k]
+
+
 class DocumentRetriever:
     """
-    Handles retrieval from Pinecone with various filtering strategies
+    Advanced document retrieval with multiple search strategies.
+
+    Features:
+    - Basic semantic search with metadata filters
+    - Hybrid search (semantic + BM25)
+    - LLM reranking
+    - HyDE (Hypothetical Document Embeddings)
+    - Query expansion
     """
 
-    def __init__(self, indexer: PineconeIndexer):
-        self.indexer = indexer
-
-    def search_all(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    def __init__(
+        self,
+        indexer: PineconeIndexer,
+        aws_region: str = None,
+        claude_model: str = None,
+        max_workers: int = 3
+    ):
         """
-        Basic semantic search without filters
+        Initialize document retriever.
+
+        Args:
+            indexer: PineconeIndexer instance
+            aws_region: AWS region for Bedrock
+            claude_model: Claude model ID for reranking and HyDE
+            max_workers: Max parallel workers for LLM calls
+        """
+        self.indexer = indexer
+        self.embedding_client = indexer.embedding_client
+        self.max_workers = max_workers
+
+        # Initialize Bedrock client for Claude
+        aws_region = aws_region or os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+        self.bedrock_client = boto3.client(
+            service_name="bedrock-runtime",
+            region_name=aws_region
+        )
+        self.claude_model = claude_model or os.getenv("AWS_BEDROCK_CLAUDE_MODEL")
+
+        # BM25 index (populated when needed)
+        self.bm25: Optional[BM25] = None
+        self._bm25_docs: Dict[str, str] = {}
+
+    def _call_claude(self, prompt: str, max_tokens: int = 500) -> str:
+        """Call Claude via AWS Bedrock."""
+        native_request = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
+            "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+        }
+
+        response = self.bedrock_client.invoke_model(
+            modelId=self.claude_model,
+            body=json.dumps(native_request)
+        )
+
+        model_response = json.loads(response["body"].read())
+        return model_response["content"][0]["text"].strip()
+
+    def _to_results(self, matches: List[Any]) -> List[RetrievalResult]:
+        """Convert Pinecone matches to RetrievalResult objects."""
+        results = []
+        for match in matches:
+            results.append(RetrievalResult(
+                chunk_id=match.id,
+                score=match.score,
+                content=match.metadata.get("original_content", ""),
+                metadata=dict(match.metadata)
+            ))
+        return results
+
+    # =========================================================================
+    # Basic Filtered Search
+    # =========================================================================
+
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        filters: Optional[Dict[str, Any]] = None
+    ) -> List[RetrievalResult]:
+        """
+        Basic semantic search with optional filters.
 
         Args:
             query: Search query
             top_k: Number of results
+            filters: Pinecone filter dictionary
 
         Returns:
-            List of matches
+            List of retrieval results
         """
-        return self.indexer.query_with_filters(
-            query_text=query,
-            filters=None,
-            top_k=top_k
-        )
+        matches = self.indexer.query_with_filters(query, filters, top_k)
+        return self._to_results(matches)
 
     def search_by_document(
         self,
         query: str,
         document: str,
         top_k: int = 5
-    ) -> List[Dict[str, Any]]:
-        """
-        Search within a specific document
+    ) -> List[RetrievalResult]:
+        """Search within a specific document."""
+        return self.search(query, top_k, {"document": {"$eq": document}})
 
-        Args:
-            query: Search query
-            document: Document name to filter by
-            top_k: Number of results
-
-        Returns:
-            List of matches from specified document
-        """
-        filters = {"document": {"$eq": document}}
-        return self.indexer.query_with_filters(query, filters, top_k)
-
-    def search_by_chunk_type(
+    def search_by_type(
         self,
         query: str,
         chunk_type: str,
         top_k: int = 5
-    ) -> List[Dict[str, Any]]:
-        """
-        Search for specific content types
-
-        Args:
-            query: Search query
-            chunk_type: Type to filter by ("text", "table", "image")
-            top_k: Number of results
-
-        Returns:
-            List of matches of specified type
-        """
-        filters = {"chunk_type": {"$eq": chunk_type}}
-        return self.indexer.query_with_filters(query, filters, top_k)
+    ) -> List[RetrievalResult]:
+        """Search for specific content types (text, table, image)."""
+        return self.search(query, top_k, {"chunk_type": {"$eq": chunk_type}})
 
     def search_by_page_range(
         self,
@@ -81,83 +280,17 @@ class DocumentRetriever:
         min_page: int,
         max_page: int,
         top_k: int = 5
-    ) -> List[Dict[str, Any]]:
-        """
-        Search within a page range
-
-        Args:
-            query: Search query
-            min_page: Minimum page number (inclusive)
-            max_page: Maximum page number (inclusive)
-            top_k: Number of results
-
-        Returns:
-            List of matches within page range
-        """
+    ) -> List[RetrievalResult]:
+        """Search within a page range."""
         filters = {
             "$and": [
                 {"page_number": {"$gte": min_page}},
                 {"page_number": {"$lte": max_page}}
             ]
         }
-        return self.indexer.query_with_filters(query, filters, top_k)
+        return self.search(query, top_k, filters)
 
-    def search_images_only(
-        self,
-        query: str,
-        top_k: int = 5
-    ) -> List[Dict[str, Any]]:
-        """
-        Search only chunks with images
-
-        Args:
-            query: Search query
-            top_k: Number of results
-
-        Returns:
-            List of image chunk matches
-        """
-        filters = {"has_image": {"$eq": True}}
-        return self.indexer.query_with_filters(query, filters, top_k)
-
-    def search_tables_only(
-        self,
-        query: str,
-        top_k: int = 5
-    ) -> List[Dict[str, Any]]:
-        """
-        Search only table chunks
-
-        Args:
-            query: Search query
-            top_k: Number of results
-
-        Returns:
-            List of table chunk matches
-        """
-        return self.search_by_chunk_type(query, "table", top_k)
-
-    def search_by_section(
-        self,
-        query: str,
-        section_title: str,
-        top_k: int = 5
-    ) -> List[Dict[str, Any]]:
-        """
-        Search within a specific section
-
-        Args:
-            query: Search query
-            section_title: Section title to filter by
-            top_k: Number of results
-
-        Returns:
-            List of matches from specified section
-        """
-        filters = {"section_title": {"$eq": section_title}}
-        return self.indexer.query_with_filters(query, filters, top_k)
-
-    def search_with_combined_filters(
+    def search_combined(
         self,
         query: str,
         document: Optional[str] = None,
@@ -166,161 +299,410 @@ class DocumentRetriever:
         max_page: Optional[int] = None,
         has_image: Optional[bool] = None,
         top_k: int = 5
-    ) -> List[Dict[str, Any]]:
+    ) -> List[RetrievalResult]:
+        """Search with multiple combined filters."""
+        conditions = []
+        if document:
+            conditions.append({"document": {"$eq": document}})
+        if chunk_type:
+            conditions.append({"chunk_type": {"$eq": chunk_type}})
+        if min_page is not None:
+            conditions.append({"page_number": {"$gte": min_page}})
+        if max_page is not None:
+            conditions.append({"page_number": {"$lte": max_page}})
+        if has_image is not None:
+            conditions.append({"has_image": {"$eq": has_image}})
+
+        filters = {"$and": conditions} if conditions else None
+        return self.search(query, top_k, filters)
+
+    # =========================================================================
+    # Hybrid Search (Semantic + BM25)
+    # =========================================================================
+
+    def index_for_bm25(self, documents: Dict[str, str]):
         """
-        Search with multiple combined filters
+        Index documents for BM25 search.
+
+        Args:
+            documents: Dictionary mapping chunk_id to content
+        """
+        self.bm25 = BM25()
+        self._bm25_docs = documents
+        self.bm25.index_documents(documents)
+
+    def hybrid_search(
+        self,
+        query: str,
+        top_k: int = 10,
+        semantic_weight: float = 0.7,
+        filters: Optional[Dict[str, Any]] = None
+    ) -> List[RetrievalResult]:
+        """
+        Hybrid search combining semantic similarity and BM25 keyword matching.
+
+        Uses Reciprocal Rank Fusion (RRF) to combine rankings.
 
         Args:
             query: Search query
-            document: Filter by document name
-            chunk_type: Filter by chunk type
-            min_page: Minimum page number
-            max_page: Maximum page number
-            has_image: Filter by image presence
-            top_k: Number of results
+            top_k: Number of results to return
+            semantic_weight: Weight for semantic scores (0-1)
+            filters: Optional Pinecone filters
 
         Returns:
-            List of matches meeting all criteria
+            Combined ranked results
         """
-        filter_conditions = []
+        semantic_results = self.search(query, top_k * 2, filters)
 
-        if document:
-            filter_conditions.append({"document": {"$eq": document}})
+        if self.bm25 is None:
+            return semantic_results[:top_k]
 
-        if chunk_type:
-            filter_conditions.append({"chunk_type": {"$eq": chunk_type}})
+        bm25_scores = self.bm25.search(query, top_k * 2)
 
-        if min_page is not None:
-            filter_conditions.append({"page_number": {"$gte": min_page}})
+        # Reciprocal Rank Fusion
+        rrf_scores: Dict[str, float] = defaultdict(float)
+        k = 60
 
-        if max_page is not None:
-            filter_conditions.append({"page_number": {"$lte": max_page}})
+        for rank, result in enumerate(semantic_results):
+            rrf_scores[result.chunk_id] += semantic_weight * (1 / (k + rank + 1))
 
-        if has_image is not None:
-            filter_conditions.append({"has_image": {"$eq": has_image}})
+        bm25_weight = 1 - semantic_weight
+        for rank, (doc_id, _) in enumerate(bm25_scores):
+            rrf_scores[doc_id] += bm25_weight * (1 / (k + rank + 1))
 
-        # Combine all filters with AND
-        filters = {"$and": filter_conditions} if filter_conditions else None
+        sorted_ids = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)
 
-        return self.indexer.query_with_filters(query, filters, top_k)
+        results = []
+        result_map = {r.chunk_id: r for r in semantic_results}
 
-    def print_results(self, results: List[Any], query: str):
+        for chunk_id in sorted_ids[:top_k]:
+            if chunk_id in result_map:
+                result = result_map[chunk_id]
+                result.score = rrf_scores[chunk_id]
+                results.append(result)
+            elif chunk_id in self._bm25_docs:
+                results.append(RetrievalResult(
+                    chunk_id=chunk_id,
+                    score=rrf_scores[chunk_id],
+                    content=self._bm25_docs[chunk_id],
+                    metadata={"source": "bm25"}
+                ))
+
+        return results
+
+    # =========================================================================
+    # LLM Reranking
+    # =========================================================================
+
+    def rerank(
+        self,
+        query: str,
+        results: List[RetrievalResult],
+        top_k: int = 5
+    ) -> List[RetrievalResult]:
         """
-        Pretty print search results
+        Rerank results using Claude to score relevance.
 
         Args:
-            results: List of search results
-            query: Original query for display
+            query: Original search query
+            results: Initial retrieval results
+            top_k: Number of results to return after reranking
+
+        Returns:
+            Reranked results
         """
+        if not results:
+            return []
+
+        docs_text = ""
+        for i, result in enumerate(results):
+            content = result.content[:500]
+            docs_text += f"\n[Document {i+1}]\n{content}\n"
+
+        prompt = f"""Given the query and documents below, rank the documents by relevance.
+Return ONLY a comma-separated list of document numbers in order of relevance (most relevant first).
+
+Query: {query}
+
+Documents:
+{docs_text}
+
+Ranking (comma-separated numbers):"""
+
+        try:
+            response = self._call_claude(prompt, max_tokens=100)
+            numbers = re.findall(r'\d+', response)
+            ranking = [int(n) - 1 for n in numbers if 0 < int(n) <= len(results)]
+
+            seen = set()
+            reranked = []
+            for idx in ranking:
+                if idx not in seen:
+                    seen.add(idx)
+                    result = results[idx]
+                    result.score = 1.0 - (len(reranked) * 0.1)
+                    reranked.append(result)
+
+            for idx, result in enumerate(results):
+                if idx not in seen and len(reranked) < top_k:
+                    reranked.append(result)
+
+            return reranked[:top_k]
+
+        except Exception as e:
+            print(f"Reranking failed: {e}")
+            return results[:top_k]
+
+    # =========================================================================
+    # HyDE (Hypothetical Document Embeddings)
+    # =========================================================================
+
+    def hyde_search(
+        self,
+        query: str,
+        top_k: int = 5,
+        filters: Optional[Dict[str, Any]] = None
+    ) -> List[RetrievalResult]:
+        """
+        HyDE: Generate a hypothetical document, then search with its embedding.
+
+        Args:
+            query: Search query
+            top_k: Number of results
+            filters: Optional Pinecone filters
+
+        Returns:
+            Search results
+        """
+        prompt = f"""Write a short, detailed paragraph that would be a perfect answer to this question.
+Write the content directly as if from a reference document. No preamble.
+
+Question: {query}
+
+Answer:"""
+
+        try:
+            hypothetical_doc = self._call_claude(prompt, max_tokens=200)
+            matches = self.indexer.query_with_filters(hypothetical_doc, filters, top_k)
+            results = self._to_results(matches)
+
+            for result in results:
+                result.metadata["hyde_query"] = hypothetical_doc
+
+            return results
+
+        except Exception as e:
+            print(f"HyDE failed: {e}")
+            return self.search(query, top_k, filters)
+
+    # =========================================================================
+    # Query Expansion
+    # =========================================================================
+
+    def expand_query(self, query: str, num_expansions: int = 3) -> List[str]:
+        """
+        Generate query variations to improve recall.
+
+        Args:
+            query: Original query
+            num_expansions: Number of variations to generate
+
+        Returns:
+            List of query variations including original
+        """
+        prompt = f"""Generate {num_expansions} different ways to phrase this search query.
+Each variation should capture the same intent but use different words.
+Return ONLY the variations, one per line, no numbering.
+
+Original: {query}
+
+Variations:"""
+
+        try:
+            response = self._call_claude(prompt, max_tokens=200)
+            variations = [line.strip() for line in response.split('\n') if line.strip()]
+            return [query] + variations[:num_expansions]
+
+        except Exception as e:
+            print(f"Query expansion failed: {e}")
+            return [query]
+
+    def search_expanded(
+        self,
+        query: str,
+        top_k: int = 5,
+        num_expansions: int = 3,
+        filters: Optional[Dict[str, Any]] = None
+    ) -> List[RetrievalResult]:
+        """
+        Search with query expansion for improved recall.
+
+        Args:
+            query: Original query
+            top_k: Number of final results
+            num_expansions: Number of query variations
+            filters: Optional Pinecone filters
+
+        Returns:
+            Combined and deduplicated results
+        """
+        queries = self.expand_query(query, num_expansions)
+
+        all_results: Dict[str, RetrievalResult] = {}
+        chunk_scores: Dict[str, List[float]] = defaultdict(list)
+
+        def search_query(q: str) -> List[RetrievalResult]:
+            return self.search(q, top_k, filters)
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {executor.submit(search_query, q): q for q in queries}
+            for future in as_completed(futures):
+                for result in future.result():
+                    chunk_scores[result.chunk_id].append(result.score)
+                    if result.chunk_id not in all_results:
+                        all_results[result.chunk_id] = result
+
+        final_results = []
+        for chunk_id, result in all_results.items():
+            scores = chunk_scores[chunk_id]
+            result.score = sum(scores) / len(scores)
+            final_results.append(result)
+
+        final_results.sort(key=lambda x: x.score, reverse=True)
+        return final_results[:top_k]
+
+    # =========================================================================
+    # Combined Advanced Search
+    # =========================================================================
+
+    def advanced_search(
+        self,
+        query: str,
+        top_k: int = 5,
+        use_hyde: bool = True,
+        use_expansion: bool = True,
+        use_reranking: bool = True,
+        filters: Optional[Dict[str, Any]] = None
+    ) -> List[RetrievalResult]:
+        """
+        Full advanced search pipeline combining multiple techniques.
+
+        Pipeline:
+        1. Standard semantic search
+        2. HyDE search (if enabled)
+        3. Query expansion (if enabled)
+        4. Combine and deduplicate
+        5. LLM reranking (if enabled)
+
+        Args:
+            query: Search query
+            top_k: Number of results
+            use_hyde: Whether to use HyDE
+            use_expansion: Whether to use query expansion
+            use_reranking: Whether to use LLM reranking
+            filters: Optional Pinecone filters
+
+        Returns:
+            Final ranked results
+        """
+        all_results: Dict[str, RetrievalResult] = {}
+        chunk_scores: Dict[str, List[float]] = defaultdict(list)
+
+        # Standard search
+        for result in self.search(query, top_k * 2, filters):
+            chunk_scores[result.chunk_id].append(result.score)
+            all_results[result.chunk_id] = result
+
+        # HyDE search
+        if use_hyde:
+            for result in self.hyde_search(query, top_k * 2, filters):
+                chunk_scores[result.chunk_id].append(result.score)
+                if result.chunk_id not in all_results:
+                    all_results[result.chunk_id] = result
+
+        # Query expansion
+        if use_expansion:
+            for result in self.search_expanded(query, top_k * 2, 2, filters):
+                chunk_scores[result.chunk_id].append(result.score)
+                if result.chunk_id not in all_results:
+                    all_results[result.chunk_id] = result
+
+        # Combine scores
+        combined = []
+        for chunk_id, result in all_results.items():
+            scores = chunk_scores[chunk_id]
+            result.score = sum(scores) / len(scores)
+            combined.append(result)
+
+        combined.sort(key=lambda x: x.score, reverse=True)
+
+        # Rerank
+        if use_reranking:
+            return self.rerank(query, combined[:top_k * 2], top_k)
+
+        return combined[:top_k]
+
+    # =========================================================================
+    # Utility Methods
+    # =========================================================================
+
+    def print_results(self, results: List[RetrievalResult], query: str):
+        """Pretty print search results."""
         print(f"\nQuery: '{query}'")
         print(f"Found {len(results)} results")
         print("=" * 80)
 
-        for i, match in enumerate(results, 1):
-            metadata = match.metadata
-            print(f"\n{i}. Score: {match.score:.4f}")
-            print(f"   Document: {metadata.get('document', 'N/A')}")
-            print(f"   Chunk ID: {metadata.get('chunk_id', 'N/A')}")
-            print(f"   Type: {metadata.get('chunk_type', 'N/A')}")
-            print(f"   Page: {metadata.get('page_number', 'N/A')}")
+        for i, result in enumerate(results, 1):
+            print(f"\n{i}. Score: {result.score:.4f}")
+            print(f"   Chunk: {result.chunk_id}")
+            print(f"   Document: {result.metadata.get('document', 'N/A')}")
+            print(f"   Type: {result.metadata.get('chunk_type', 'N/A')}")
+            print(f"   Page: {result.metadata.get('page_number', 'N/A')}")
 
-            if metadata.get('section_title'):
-                print(f"   Section: {metadata.get('section_title')}")
+            if result.metadata.get('section_title'):
+                print(f"   Section: {result.metadata['section_title']}")
 
-            if metadata.get('has_image'):
-                print(f"   Contains Image: Yes")
-                if metadata.get('image_description'):
-                    desc = metadata.get('image_description')[:100]
-                    print(f"   Image Desc: {desc}...")
-
-            # Show content preview
-            content = metadata.get('original_content', '')
-            preview = content[:200].replace('\n', ' ')
+            preview = result.content[:200].replace('\n', ' ')
             print(f"   Preview: {preview}...")
 
 
 if __name__ == "__main__":
-    # Initialize indexer and retriever
     indexer = PineconeIndexer(
         index_name=os.getenv("PINECONE_INDEX_NAME", "data-ingest"),
         embedding_dimensions=1024,
-        normalize_embeddings=True,
-        aws_region=os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
-        metric="cosine"
+        aws_region=os.getenv("AWS_DEFAULT_REGION", "us-east-1")
     )
 
     retriever = DocumentRetriever(indexer)
 
     print("=" * 80)
-    print("RETRIEVAL EXAMPLES WITH METADATA FILTERING")
+    print("RETRIEVAL EXAMPLES")
     print("=" * 80)
 
-    # Example 1: Basic semantic search
-    print("\n\n1. BASIC SEMANTIC SEARCH (no filters)")
-    print("-" * 80)
-    results = retriever.search_all("blood transfusion protocol", top_k=3)
-    retriever.print_results(results, "blood transfusion protocol")
+    query = "blood transfusion safety protocols"
 
-    # Example 2: Search specific document
-    print("\n\n2. SEARCH WITHIN SPECIFIC DOCUMENT")
-    print("-" * 80)
-    results = retriever.search_by_document(
-        query="emergency procedures",
-        document="Module 1 - Introduction to Emergency Fresh Whole Blood Transfusion V1.6",
-        top_k=3
-    )
-    retriever.print_results(results, "emergency procedures [document filter]")
+    # Basic search
+    print("\n1. BASIC SEMANTIC SEARCH")
+    print("-" * 40)
+    results = retriever.search(query, top_k=3)
+    retriever.print_results(results, query)
 
-    # Example 3: Search tables only
-    print("\n\n3. SEARCH TABLES ONLY")
-    print("-" * 80)
-    results = retriever.search_tables_only("dosage guidelines", top_k=3)
-    retriever.print_results(results, "dosage guidelines [tables only]")
+    # HyDE search
+    print("\n2. HyDE SEARCH")
+    print("-" * 40)
+    results = retriever.hyde_search(query, top_k=3)
+    retriever.print_results(results, query)
 
-    # Example 4: Search by page range
-    print("\n\n4. SEARCH WITHIN PAGE RANGE")
-    print("-" * 80)
-    results = retriever.search_by_page_range(
-        query="safety precautions",
-        min_page=5,
-        max_page=15,
-        top_k=3
-    )
-    retriever.print_results(results, "safety precautions [pages 5-15]")
+    # Query expansion
+    print("\n3. QUERY EXPANSION SEARCH")
+    print("-" * 40)
+    results = retriever.search_expanded(query, top_k=3)
+    retriever.print_results(results, query)
 
-    # Example 5: Search images only
-    print("\n\n5. SEARCH IMAGES ONLY")
-    print("-" * 80)
-    results = retriever.search_images_only("medical diagram", top_k=3)
-    retriever.print_results(results, "medical diagram [images only]")
+    # Advanced search
+    print("\n4. ADVANCED SEARCH (HyDE + Expansion + Reranking)")
+    print("-" * 40)
+    results = retriever.advanced_search(query, top_k=3)
+    retriever.print_results(results, query)
 
-    # Example 6: Combined filters
-    print("\n\n6. COMBINED FILTERS")
-    print("-" * 80)
-    results = retriever.search_with_combined_filters(
-        query="treatment protocol",
-        chunk_type="text",
-        min_page=1,
-        max_page=20,
-        has_image=False,
-        top_k=3
-    )
-    retriever.print_results(
-        results,
-        "treatment protocol [text chunks, pages 1-20, no images]"
-    )
-
-    # Example 7: Custom filter - high token count chunks
-    print("\n\n7. CUSTOM FILTER - LARGE CHUNKS")
-    print("-" * 80)
-    custom_filters = {"token_count": {"$gte": 500}}
-    results = indexer.query_with_filters(
-        query_text="comprehensive overview",
-        filters=custom_filters,
-        top_k=3
-    )
-    retriever.print_results(results, "comprehensive overview [large chunks only]")
-
-    print("\n\n" + "=" * 80)
-    print("RETRIEVAL EXAMPLES COMPLETE")
-    print("=" * 80)
+    print("\n" + "=" * 80)

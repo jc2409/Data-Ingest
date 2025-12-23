@@ -10,7 +10,7 @@ from .embedding import EmbeddingClient, get_embedding, cosine_similarity
 from .process_documents import DocumentProcessing
 from .contextual_chunking import ContextualChunker, Chunk
 from .indexing import PineconeIndexer
-from .retrieve import DocumentRetriever
+from .retrieve import DocumentRetriever, RetrievalResult, BM25
 
 __all__ = [
     "DocumentProcessing",
@@ -18,6 +18,8 @@ __all__ = [
     "Chunk",
     "PineconeIndexer",
     "DocumentRetriever",
+    "RetrievalResult",
+    "BM25",
     "EmbeddingClient",
     "get_embedding",
     "cosine_similarity",

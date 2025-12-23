@@ -1,13 +1,15 @@
 # Data Ingest
 
-A document processing pipeline that extracts content from various file formats, generates semantic chunks with AI-powered contextual summaries, and indexes them into Pinecone for filtered retrieval.
+A document processing pipeline that extracts content from various file formats, generates semantic chunks with AI-powered contextual summaries, and indexes them into Pinecone for retrieval.
 
 ## Features
 
 - **Multi-format extraction** — PDF, DOCX, PPTX, HTML, TXT, CSV via Unstructured.io
 - **Contextual chunking** — Semantic grouping with AI-generated context using Claude
+- **Overlapping chunks** — Configurable overlap for better boundary handling
 - **Image understanding** — Automatic descriptions via Claude Vision
 - **Vector indexing** — Pinecone integration with metadata filtering
+- **Advanced retrieval** — Hybrid search, HyDE, query expansion, LLM reranking
 - **Embedding caching** — LRU cache to avoid redundant API calls
 
 ## Prerequisites
@@ -32,35 +34,6 @@ cp .env.example .env
 
 # Run pipeline
 make pipeline    # Runs: process → chunk → index
-
-# Or run steps individually
-make process     # 1. Extract documents
-make chunk       # 2. Generate chunks
-make index       # 3. Index to Pinecone
-```
-
-## Project Structure
-
-```
-data-ingest/
-├── src/
-│   ├── __init__.py              # Package exports
-│   ├── embedding.py             # Shared embedding client with caching
-│   ├── process_documents.py     # Document extraction
-│   ├── contextual_chunking.py   # Semantic chunking + context generation
-│   ├── indexing.py              # Pinecone vector indexing
-│   └── retrieve.py              # Retrieval examples
-├── tests/
-│   ├── conftest.py              # Test fixtures
-│   ├── test_*.py                # Unit tests
-│   └── test_integration.py      # Integration tests (real APIs)
-├── dataset/
-│   ├── src/                     # Input: source documents
-│   ├── res/                     # Output: extracted JSON
-│   └── chunks/                  # Output: contextual chunks
-├── Makefile                     # Pipeline commands
-├── .env.example                 # Environment template
-└── pyproject.toml               # Dependencies
 ```
 
 ## Configuration
@@ -94,32 +67,39 @@ UNSTRUCTURED_API_URL=
 ```bash
 make help              # Show all commands
 make process           # Extract documents from dataset/src/
-make chunk             # Chunk all files in dataset/res/
-make chunk FILE=x.json # Chunk single file
+make chunk             # Chunk with basic strategy (default)
+make chunk-semantic    # Chunk with semantic strategy
 make index             # Index to Pinecone
 make pipeline          # Run full pipeline
 make stats             # Show index statistics
 make clean             # Remove generated files
 ```
 
-### Index & Query
+### Python API
 
 ```python
 from src import PineconeIndexer, DocumentRetriever
 
-# Index
+# Index chunks
 indexer = PineconeIndexer(index_name="data-ingest")
 indexer.index_from_directory("dataset/chunks")
 
-# Query with filters
+# Basic search
 retriever = DocumentRetriever(indexer)
-results = retriever.search_with_combined_filters(
-    query="control system design",
+results = retriever.search("control system design", top_k=5)
+
+# Filtered search
+results = retriever.search_combined(
+    query="safety protocol",
     chunk_type="text",
     min_page=1,
-    max_page=50,
-    top_k=5
+    max_page=50
 )
+
+# Advanced retrieval
+results = retriever.hyde_search("what is the protocol?")      # HyDE
+results = retriever.search_expanded("query", num_expansions=3) # Query expansion
+results = retriever.advanced_search("query", use_reranking=True) # Full pipeline
 ```
 
 ### Metadata Filters
@@ -131,56 +111,32 @@ results = retriever.search_with_combined_filters(
 | `page_number` | int | Page number |
 | `section_title` | string | Section heading |
 | `has_image` | bool | Contains image |
-| `token_count` | int | Token count |
 
 ## Testing
 
 ```bash
 make dev               # Install dev dependencies
 make test              # Run unit tests
-make test-integration  # Run integration tests (real APIs)
+make test-integration  # Run integration tests (requires API credentials)
 make coverage          # Run tests with coverage report
 ```
 
-## API Reference
+## Project Structure
 
-### EmbeddingClient
-
-```python
-from src import EmbeddingClient, cosine_similarity
-
-client = EmbeddingClient(dimensions=1024)
-emb = client.get_embedding("text")      # Returns numpy array (cached)
-emb_list = client.get_embedding_list("text")  # Returns list
-client.cache_info()                      # Cache statistics
 ```
-
-### ContextualChunker
-
-```python
-from src import ContextualChunker
-
-chunker = ContextualChunker(
-    embedding_dimensions=1024,
-    min_chunk_size=400,
-    max_chunk_size=800
-)
-chunks = chunker.process_document(
-    json_path="dataset/res/doc.json",
-    output_path="dataset/chunks/doc_chunks.json",
-    use_llm_context=True
-)
-```
-
-### PineconeIndexer
-
-```python
-from src import PineconeIndexer
-
-indexer = PineconeIndexer(index_name="data-ingest")
-indexer.index_from_file("dataset/chunks/doc_chunks.json")
-indexer.get_index_stats()
-indexer.query_with_filters("query", filters={"chunk_type": {"$eq": "table"}})
+data-ingest/
+├── src/
+│   ├── embedding.py             # Embedding client with caching
+│   ├── process_documents.py     # Document extraction
+│   ├── contextual_chunking.py   # Chunking + context generation
+│   ├── indexing.py              # Pinecone vector indexing
+│   └── retrieve.py              # Advanced retrieval methods
+├── tests/                       # Unit and integration tests
+├── dataset/
+│   ├── src/                     # Input documents
+│   ├── res/                     # Extracted JSON
+│   └── chunks/                  # Contextual chunks
+└── Makefile                     # Pipeline commands
 ```
 
 ## References

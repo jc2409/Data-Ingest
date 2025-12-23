@@ -55,6 +55,7 @@ class ContextualChunker:
         similarity_threshold: float = 0.70,
         min_chunk_size: int = 300,
         max_chunk_size: int = 1000,
+        chunk_overlap: float = 0.0,
         max_workers: int = 5
     ):
         # AWS Bedrock client for Claude (context and vision)
@@ -78,6 +79,7 @@ class ContextualChunker:
         self.similarity_threshold = similarity_threshold
         self.min_chunk_size = min_chunk_size
         self.max_chunk_size = max_chunk_size
+        self.chunk_overlap = chunk_overlap  # 0.0 to 0.5 (e.g., 0.2 = 20% overlap)
         self.max_workers = max_workers
 
         # Initialize tokenizer (using cl100k_base for consistency)
@@ -284,10 +286,26 @@ class ContextualChunker:
                     should_split = True
 
             if should_split:
-                chunks.append(self._finalize_chunk(current_chunk))
+                finalized = self._finalize_chunk(current_chunk)
+                chunks.append(finalized)
+
+                # Get overlap from the chunk we just finalized
+                overlap_text = self._get_overlap_text(finalized)
+
+                # Start new chunk, optionally with overlap
+                new_elements = []
+                new_tokens = 0
+                if overlap_text:
+                    overlap_element = {"type": "Overlap", "text": f"[...] {overlap_text}", "metadata": {}}
+                    new_elements.append(overlap_element)
+                    new_tokens = self.count_tokens(overlap_text)
+
+                new_elements.append(element)
+                new_tokens += element_tokens
+
                 current_chunk = {
-                    "elements": [element],
-                    "tokens": element_tokens,
+                    "elements": new_elements,
+                    "tokens": new_tokens,
                     "metadata": {
                         "section_title": current_section_title,
                         "page_number": page_number
@@ -427,12 +445,26 @@ class ContextualChunker:
 
             if should_split:
                 # Save current chunk
-                chunks.append(self._finalize_chunk(current_chunk))
+                finalized = self._finalize_chunk(current_chunk)
+                chunks.append(finalized)
 
-                # Start new chunk
+                # Get overlap from the chunk we just finalized
+                overlap_text = self._get_overlap_text(finalized)
+
+                # Start new chunk, optionally with overlap
+                new_elements = []
+                new_tokens = 0
+                if overlap_text:
+                    overlap_element = {"type": "Overlap", "text": f"[...] {overlap_text}", "metadata": {}}
+                    new_elements.append(overlap_element)
+                    new_tokens = self.count_tokens(overlap_text)
+
+                new_elements.append(element)
+                new_tokens += element_tokens
+
                 current_chunk = {
-                    "elements": [element],
-                    "tokens": element_tokens,
+                    "elements": new_elements,
+                    "tokens": new_tokens,
                     "metadata": {
                         "section_title": current_section_title,
                         "page_number": page_number
@@ -576,6 +608,29 @@ class ContextualChunker:
                 texts.append(e.get("text", ""))
 
         return "\n\n".join(text for text in texts if text.strip())
+
+    def _get_overlap_text(self, chunk: Dict[str, Any]) -> Optional[str]:
+        """
+        Get overlap text from the end of a chunk.
+
+        Returns the last N% of tokens from the chunk as text,
+        where N is determined by self.chunk_overlap.
+        """
+        if self.chunk_overlap <= 0:
+            return None
+
+        chunk_text = self.combine_chunk_text(chunk)
+        if not chunk_text:
+            return None
+
+        tokens = self.tokenizer.encode(chunk_text)
+        overlap_count = int(len(tokens) * self.chunk_overlap)
+
+        if overlap_count <= 0:
+            return None
+
+        overlap_tokens = tokens[-overlap_count:]
+        return self.tokenizer.decode(overlap_tokens).strip()
 
     def _create_full_document_text(self, elements: List[Dict[str, Any]]) -> str:
         """
@@ -779,7 +834,7 @@ Please give a short succinct context to situate this chunk within the overall do
         output_path: str,
         use_llm_context: bool = True,
         parallel: bool = True,
-        chunking_strategy: str = "size"
+        chunking_strategy: str = "basic"
     ) -> List[Chunk]:
         """
         Process a single document through the full chunking pipeline.
@@ -789,7 +844,7 @@ Please give a short succinct context to situate this chunk within the overall do
             output_path: Where to save chunked output
             use_llm_context: Whether to use LLM for context generation
             parallel: Whether to process chunks in parallel (faster for LLM context)
-            chunking_strategy: Chunking method to use ("size" or "semantic")
+            chunking_strategy: Chunking method to use ("basic" or "semantic")
 
         Returns:
             List of Chunk objects
@@ -805,10 +860,10 @@ Please give a short succinct context to situate this chunk within the overall do
         # Group elements based on selected strategy
         if chunking_strategy == "semantic":
             grouped_chunks = self.group_elements_semantically(elements)
-        elif chunking_strategy == "size":
+        elif chunking_strategy == "basic":
             grouped_chunks = self.group_elements_by_size(elements)
         else:
-            raise ValueError(f"Unknown chunking_strategy: {chunking_strategy}. Use 'size' or 'semantic'.")
+            raise ValueError(f"Unknown chunking_strategy: {chunking_strategy}. Use 'basic' or 'semantic'.")
 
         # Get document name
         document_name = os.path.basename(json_path).replace(".json", "")
@@ -863,7 +918,7 @@ Please give a short succinct context to situate this chunk within the overall do
         output_dir: str,
         use_llm_context: bool = True,
         parallel: bool = True,
-        chunking_strategy: str = "size"
+        chunking_strategy: str = "basic"
     ):
         """
         Process all JSON documents in a directory.
@@ -873,7 +928,7 @@ Please give a short succinct context to situate this chunk within the overall do
             output_dir: Directory to save chunked outputs
             use_llm_context: Whether to use LLM for context generation
             parallel: Whether to use parallel processing
-            chunking_strategy: Chunking method to use ("size" or "semantic")
+            chunking_strategy: Chunking method to use ("basic" or "semantic")
         """
         os.makedirs(output_dir, exist_ok=True)
 
@@ -911,9 +966,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "-c", "--chunking",
         type=str,
-        choices=["size", "semantic"],
-        default="size",
-        help="Chunking strategy: 'size' or 'semantic' (default: size)"
+        choices=["basic", "semantic"],
+        default="basic",
+        help="Chunking strategy: 'basic' or 'semantic' (default: basic)"
     )
 
     args = parser.parse_args()
@@ -929,6 +984,7 @@ if __name__ == "__main__":
         similarity_threshold=0.70,
         min_chunk_size=400,
         max_chunk_size=800,
+        chunk_overlap=0.15,  # 15% overlap between chunks
         max_workers=3
     )
 

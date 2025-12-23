@@ -81,6 +81,19 @@ else
 	fi
 endif
 
+chunk-basic:
+ifdef FILE
+	uv run python -m src.contextual_chunking --single $(FILE) --chunking basic
+else
+	@echo "Processing all files with basic chunking..."
+	@for file in $(RES_DIR)/*.json; do \
+		if [ -f "$$file" ]; then \
+			echo "Processing: $$file"; \
+			uv run python -m src.contextual_chunking --single "$$file" --chunking basic; \
+		fi; \
+	done
+endif
+
 chunk-semantic:
 ifdef FILE
 	uv run python -m src.contextual_chunking --single $(FILE) --chunking semantic
