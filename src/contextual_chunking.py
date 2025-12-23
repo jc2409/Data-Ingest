@@ -1,17 +1,18 @@
-import sys, getopt
+import argparse
 import json
 import os
-from typing import List, Dict, Any, Optional, Tuple
-from dataclasses import dataclass
-import boto3
-from botocore.exceptions import ClientError
-import tiktoken
-import numpy as np
-from tqdm import tqdm
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dotenv import load_dotenv
 import re
-from html.parser import HTMLParser
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+import boto3
+import tiktoken
+from botocore.exceptions import ClientError
+from dotenv import load_dotenv
+from tqdm import tqdm
+
+from .embedding import EmbeddingClient, cosine_similarity
 
 load_dotenv()
 
@@ -47,7 +48,7 @@ class ContextualChunker:
         self,
         aws_region: str = "us-east-1",
         claude_model: str = os.getenv("AWS_BEDROCK_CLAUDE_MODEL"),
-        vision_model: str = os.getenv("AWS_BEDROCK_VISION_MODEL"), 
+        vision_model: str = os.getenv("AWS_BEDROCK_VISION_MODEL"),
         embedding_model: str = os.getenv("AWS_BEDROCK_TITAN_EMBEDDING_MODEL"),
         embedding_dimensions: int = 1024,
         normalize_embeddings: bool = True,
@@ -56,18 +57,23 @@ class ContextualChunker:
         max_chunk_size: int = 1000,
         max_workers: int = 5
     ):
-        # AWS Bedrock client for both embeddings and Claude
+        # AWS Bedrock client for Claude (context and vision)
         self.bedrock_client = boto3.client(
             service_name="bedrock-runtime",
             region_name=aws_region
         )
         self.claude_model = claude_model  # Used for context generation (can be Haiku)
         # Vision model for image descriptions (must support vision, e.g., Sonnet)
-        # Default to Sonnet if not specified
-        self.vision_model = vision_model 
-        self.embedding_model = embedding_model
+        self.vision_model = vision_model
+
+        # Shared embedding client with caching
+        self.embedding_client = EmbeddingClient(
+            aws_region=aws_region,
+            model_id=embedding_model,
+            dimensions=embedding_dimensions,
+            normalize=normalize_embeddings
+        )
         self.embedding_dimensions = embedding_dimensions
-        self.normalize_embeddings = normalize_embeddings
 
         self.similarity_threshold = similarity_threshold
         self.min_chunk_size = min_chunk_size
@@ -80,66 +86,6 @@ class ContextualChunker:
     def count_tokens(self, text: str) -> int:
         """Count tokens in text"""
         return len(self.tokenizer.encode(text))
-
-    def get_embedding(self, text: str) -> np.ndarray:
-        """
-        Generate embedding for text using Amazon Titan Embed Text v2
-
-        Args:
-            text: Text to embed
-
-        Returns:
-            numpy array of embedding vector
-        """
-        try:
-            # Prepare request body for Titan v2
-            request_body = {
-                "inputText": text,
-                "dimensions": self.embedding_dimensions,
-                "normalize": self.normalize_embeddings
-            }
-
-            # Invoke Titan embedding model
-            response = self.bedrock_client.invoke_model(
-                modelId=self.embedding_model,
-                body=json.dumps(request_body),
-                contentType="application/json",
-                accept="application/json"
-            )
-
-            # Parse response
-            response_body = json.loads(response['body'].read())
-            embedding = response_body.get('embedding', [])
-
-            return np.array(embedding)
-        except Exception as e:
-            print(f"Error generating embedding: {e}")
-            # Return zero vector as fallback
-            return np.zeros(self.embedding_dimensions)
-
-    def cosine_similarity(self, vec1: np.ndarray, vec2: np.ndarray) -> float:
-        """
-        Calculate cosine similarity between two vectors
-
-        Args:
-            vec1: First embedding vector
-            vec2: Second embedding vector
-
-        Returns:
-            Cosine similarity score (0-1)
-        """
-        # Handle zero vectors
-        if np.all(vec1 == 0) or np.all(vec2 == 0):
-            return 0.0
-
-        dot_product = np.dot(vec1, vec2)
-        norm1 = np.linalg.norm(vec1)
-        norm2 = np.linalg.norm(vec2)
-
-        if norm1 == 0 or norm2 == 0:
-            return 0.0
-
-        return float(dot_product / (norm1 * norm2))
 
     def load_unstructured_elements(self, json_path: str) -> List[Dict[str, Any]]:
         """Load parsed elements from Unstructured JSON output"""
@@ -389,7 +335,7 @@ class ContextualChunker:
         # Generate embeddings for all elements (with progress bar)
         element_embeddings = []
         for element in tqdm(valid_elements, desc="  Creating embeddings", leave=False):
-            embedding = self.get_embedding(element.get("text", ""))
+            embedding = self.embedding_client.get_embedding(element.get("text", ""))
             element_embeddings.append(embedding)
 
         chunks = []
@@ -465,7 +411,7 @@ class ContextualChunker:
             if current_chunk["elements"]:
                 # Calculate similarity with current chunk
                 chunk_embedding = current_chunk["embedding"]
-                similarity = self.cosine_similarity(chunk_embedding, element_embedding)
+                similarity = cosine_similarity(chunk_embedding, element_embedding)
 
                 # Split if similarity is below threshold (topic change detected)
                 if similarity < self.similarity_threshold:
@@ -948,6 +894,29 @@ Please give a short succinct context to situate this chunk within the overall do
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Contextual chunking for document processing"
+    )
+    parser.add_argument(
+        "-s", "--single",
+        type=str,
+        metavar="FILE",
+        help="Process a single document"
+    )
+    parser.add_argument(
+        "-m", "--multiple",
+        action="store_true",
+        help="Process all documents in dataset/res/"
+    )
+    parser.add_argument(
+        "-c", "--chunking",
+        type=str,
+        choices=["size", "semantic"],
+        default="size",
+        help="Chunking strategy: 'size' or 'semantic' (default: size)"
+    )
+
+    args = parser.parse_args()
 
     # Initialize chunker using Amazon Titan embeddings and AWS Bedrock Claude
     chunker = ContextualChunker(
@@ -963,54 +932,25 @@ if __name__ == "__main__":
         max_workers=3
     )
 
-    args = sys.argv[1:]
-    options = "hsmc:"
-    long_options = ["Help", "Single", "Multiple", "Chunking="]
-
-    # Default chunking strategy
-    chunking_strategy = "size"
-
-    try:
-        arguments, values = getopt.getopt(args, options, long_options)
-
-        # Parse chunking strategy first
-        for currentArg, currentVal in arguments:
-            if currentArg in ("-c", "--Chunking"):
-                chunking_strategy = currentVal
-                if chunking_strategy not in ["size", "semantic"]:
-                    print(f"Error: Invalid chunking strategy '{chunking_strategy}'. Use 'size' or 'semantic'.")
-                    sys.exit(1)
-
-        for currentArg, currentVal in arguments:
-            if currentArg in ("-h", "--Help"):
-                print("Usage: python contextual_chunking.py [options]")
-                print("Options:")
-                print("  -h, --Help                Show this help message")
-                print("  -s, --Single FILE         Process a single document")
-                print("  -m, --Multiple            Process all documents in /dataset/res/")
-                print("  -c, --Chunking STRATEGY   Chunking strategy: 'size' or 'semantic' (default: size)")
-
-            elif currentArg in ("-s", "--Single"):
-                print(f"Single Document Processing mode (chunking: {chunking_strategy})")
-
-                # Process single document
-                chunker.process_document(
-                    json_path=os.getcwd() + "/" + args[-1],
-                    output_path=os.getcwd() + "/" + args[-1].replace("/res/", "/chunks/").replace(".json", "_chunks.json"),
-                    use_llm_context=True,
-                    parallel=True,
-                    chunking_strategy=chunking_strategy
-                )
-            elif currentArg in ("-m", "--Multiple"):
-                print(f"Multiple Document Processing mode (chunking: {chunking_strategy})")
-
-                # Process all documents
-                chunker.process_all_documents(
-                    input_dir=os.getcwd() + "/dataset/res",
-                    output_dir=os.getcwd() + "/dataset/chunks",
-                    use_llm_context=True,
-                    parallel=True,
-                    chunking_strategy=chunking_strategy
-                )
-    except getopt.error as err:
-        print(str(err))
+    if args.single:
+        print(f"Single Document Processing mode (chunking: {args.chunking})")
+        json_path = os.path.join(os.getcwd(), args.single)
+        output_path = json_path.replace("/res/", "/chunks/").replace(".json", "_chunks.json")
+        chunker.process_document(
+            json_path=json_path,
+            output_path=output_path,
+            use_llm_context=True,
+            parallel=True,
+            chunking_strategy=args.chunking
+        )
+    elif args.multiple:
+        print(f"Multiple Document Processing mode (chunking: {args.chunking})")
+        chunker.process_all_documents(
+            input_dir=os.path.join(os.getcwd(), "dataset/res"),
+            output_dir=os.path.join(os.getcwd(), "dataset/chunks"),
+            use_llm_context=True,
+            parallel=True,
+            chunking_strategy=args.chunking
+        )
+    else:
+        parser.print_help()

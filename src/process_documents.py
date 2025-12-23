@@ -1,4 +1,5 @@
-import os, json
+import json
+import os
 import pathlib
 from dotenv import load_dotenv
 load_dotenv()
@@ -91,7 +92,7 @@ class DocumentProcessing():
                 )
 
             res = self.client.general.partition(request=req)
-            element_dicts = [element for element in res.elements]
+            element_dicts = list(res.elements)
 
             # Write the processed data to a local file
             json_elements = json.dumps(element_dicts, indent=2)

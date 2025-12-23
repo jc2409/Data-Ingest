@@ -1,7 +1,7 @@
 [project]
 name = "data-ingest"
 version = "0.1.0"
-description = "Add your description here"
+description = "Document processing pipeline with contextual chunking, semantic embeddings, and vector database indexing"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -15,3 +15,15 @@ dependencies = [
     "tqdm>=4.67.1",
     "unstructured-client>=0.42.4",
 ]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"

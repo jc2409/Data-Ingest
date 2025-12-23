@@ -4,7 +4,7 @@ Demonstrates various filtered search patterns
 """
 import os
 from typing import List, Dict, Any, Optional
-from src.indexing import PineconeIndexer
+from .indexing import PineconeIndexer
 from dotenv import load_dotenv
 
 load_dotenv()

@@ -53,7 +53,7 @@ for file in "$RES_DIR"/*.json; do
     echo "=========================================="
 
     # Run chunking with single-document mode
-    if uv run python src/contextual_chunking.py -s "$file"; then
+    if uv run python -m src.contextual_chunking --single "$file"; then
         ((successful++))
         echo -e "${GREEN}✓ Successfully processed: $filename${NC}"
     else

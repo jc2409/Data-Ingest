@@ -2,13 +2,16 @@
 Index contextualized chunks into Pinecone vector database
 Preserves all metadata for filtered retrieval
 """
-import os
+import glob
 import json
-import boto3
-from typing import List, Dict, Any, Optional
+import os
+from typing import Any, Dict, List, Optional
+
+from dotenv import load_dotenv
 from pinecone import Pinecone, ServerlessSpec
 from tqdm import tqdm
-from dotenv import load_dotenv
+
+from .embedding import EmbeddingClient
 
 load_dotenv()
 
@@ -52,13 +55,13 @@ class PineconeIndexer:
         self.embedding_dimensions = embedding_dimensions
         self.batch_size = batch_size
 
-        # Initialize AWS Bedrock for embeddings
-        self.bedrock_client = boto3.client(
-            service_name="bedrock-runtime",
-            region_name=aws_region
+        # Shared embedding client with caching
+        self.embedding_client = EmbeddingClient(
+            aws_region=aws_region,
+            model_id=embedding_model,
+            dimensions=embedding_dimensions,
+            normalize=normalize_embeddings
         )
-        self.embedding_model = embedding_model
-        self.normalize_embeddings = normalize_embeddings
 
         # Create or connect to index
         self._setup_index(metric)
@@ -85,37 +88,6 @@ class PineconeIndexer:
         # Connect to index
         self.index = self.pc.Index(self.index_name)
 
-    def get_embedding(self, text: str) -> List[float]:
-        """
-        Generate embedding using Amazon Titan
-
-        Args:
-            text: Text to embed
-
-        Returns:
-            List of floats representing the embedding
-        """
-        try:
-            request_body = {
-                "inputText": text,
-                "dimensions": self.embedding_dimensions,
-                "normalize": self.normalize_embeddings
-            }
-
-            response = self.bedrock_client.invoke_model(
-                modelId=self.embedding_model,
-                body=json.dumps(request_body),
-                contentType="application/json",
-                accept="application/json"
-            )
-
-            response_body = json.loads(response['body'].read())
-            return response_body.get('embedding', [])
-
-        except Exception as e:
-            print(f"Error generating embedding: {e}")
-            return [0.0] * self.embedding_dimensions
-
     def prepare_vector(self, chunk: Dict[str, Any]) -> Dict[str, Any]:
         """
         Prepare a chunk for Pinecone upsert with filterable metadata
@@ -127,7 +99,7 @@ class PineconeIndexer:
             Dictionary with id, values, and metadata for Pinecone
         """
         # Generate embedding from contextualized content
-        embedding = self.get_embedding(chunk['contextualized_content'])
+        embedding = self.embedding_client.get_embedding_list(chunk['contextualized_content'])
 
         # Prepare metadata for filtered search
         # All fields here are filterable in Pinecone queries
@@ -232,8 +204,6 @@ class PineconeIndexer:
         Returns:
             Indexing statistics
         """
-        import glob
-
         chunk_files = glob.glob(os.path.join(chunks_dir, "*_chunks.json"))
         print(f"Found {len(chunk_files)} chunk files")
 
@@ -286,7 +256,7 @@ class PineconeIndexer:
             ]}
         """
         # Generate query embedding
-        query_embedding = self.get_embedding(query_text)
+        query_embedding = self.embedding_client.get_embedding_list(query_text)
 
         # Query Pinecone
         results = self.index.query(
