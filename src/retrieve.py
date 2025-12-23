@@ -439,13 +439,11 @@ Ranking (comma-separated numbers):"""
             for idx in ranking:
                 if idx not in seen:
                     seen.add(idx)
-                    result = results[idx]
-                    result.score = 1.0 - (len(reranked) * 0.1)
-                    reranked.append(result)
+                    reranked.append(results[idx])
 
             for idx, result in enumerate(results):
                 if idx not in seen and len(reranked) < top_k:
-                    reranked.append(result)
+                    reranked.append(results[idx])
 
             return reranked[:top_k]
 
@@ -483,6 +481,7 @@ Answer:"""
 
         try:
             hypothetical_doc = self._call_claude(prompt, max_tokens=200)
+            print(f"\nHyDE Answer: '{hypothetical_doc}'")
             matches = self.indexer.query_with_filters(hypothetical_doc, filters, top_k)
             results = self._to_results(matches)
 
@@ -521,6 +520,9 @@ Variations:"""
         try:
             response = self._call_claude(prompt, max_tokens=200)
             variations = [line.strip() for line in response.split('\n') if line.strip()]
+            print(f"\nQuery variations:\n")
+            for v in variations:
+                print(f"- {v}")
             return [query] + variations[:num_expansions]
 
         except Exception as e:
@@ -646,14 +648,17 @@ Variations:"""
     # Utility Methods
     # =========================================================================
 
-    def print_results(self, results: List[RetrievalResult], query: str):
+    def print_results(self, results: List[RetrievalResult], query: str, show_score: bool = True):
         """Pretty print search results."""
         print(f"\nQuery: '{query}'")
         print(f"Found {len(results)} results")
         print("=" * 80)
 
-        for i, result in enumerate(results, 1):
-            print(f"\n{i}. Score: {result.score:.4f}")
+        for rank, result in enumerate(results, 1):
+            if show_score:
+                print(f"\n{rank}. Score: {result.score:.4f}")
+            else:
+                print(f"\nRank {rank}")
             print(f"   Chunk: {result.chunk_id}")
             print(f"   Document: {result.metadata.get('document', 'N/A')}")
             print(f"   Type: {result.metadata.get('chunk_type', 'N/A')}")
@@ -679,7 +684,7 @@ if __name__ == "__main__":
     print("RETRIEVAL EXAMPLES")
     print("=" * 80)
 
-    query = "blood transfusion safety protocols"
+    query = input("Enter your search query: ")
 
     # Basic search
     print("\n1. BASIC SEMANTIC SEARCH")
@@ -703,6 +708,6 @@ if __name__ == "__main__":
     print("\n4. ADVANCED SEARCH (HyDE + Expansion + Reranking)")
     print("-" * 40)
     results = retriever.advanced_search(query, top_k=3)
-    retriever.print_results(results, query)
+    retriever.print_results(results, query, show_score=False)
 
     print("\n" + "=" * 80)

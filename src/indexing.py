@@ -310,22 +310,3 @@ if __name__ == "__main__":
     print(f"  Total vectors in index: {stats['total_vectors']}")
     print(f"  Dimensions: {stats['dimensions']}")
     print("="*60)
-
-    # Example: Query with filters
-    print("\n" + "="*60)
-    print("Example Filtered Search:")
-    print("="*60)
-
-    # Search for tables only
-    results = indexer.query_with_filters(
-        query_text="blood transfusion protocol",
-        filters={"chunk_type": {"$eq": "table"}},
-        top_k=3
-    )
-
-    print(f"\nFound {len(results)} table chunks:")
-    for i, match in enumerate(results, 1):
-        print(f"\n{i}. Score: {match.score:.4f}")
-        print(f"   Document: {match.metadata.get('document')}")
-        print(f"   Page: {match.metadata.get('page_number')}")
-        print(f"   Type: {match.metadata.get('chunk_type')}")
