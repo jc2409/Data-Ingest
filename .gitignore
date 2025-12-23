@@ -14,3 +14,6 @@ dataset/src/*
 dataset/chunks/*
 dataset/res/*
 dataset/tmp/
+
+.coverage
+htmlcov/

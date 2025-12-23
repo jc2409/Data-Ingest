@@ -24,16 +24,19 @@ A document processing pipeline that extracts content from various file formats, 
 # Clone and install
 git clone git@github.com:jc2409/Data-Ingest.git
 cd Data-Ingest
-uv sync
+make install
 
 # Configure credentials
 cp .env.example .env
 # Edit .env with your API keys
 
 # Run pipeline
-uv run python -m src.process_documents      # 1. Extract documents
-./chunk_all_documents.sh                     # 2. Generate chunks
-uv run python -m src.indexing                # 3. Index to Pinecone
+make pipeline    # Runs: process → chunk → index
+
+# Or run steps individually
+make process     # 1. Extract documents
+make chunk       # 2. Generate chunks
+make index       # 3. Index to Pinecone
 ```
 
 ## Project Structure
@@ -49,16 +52,13 @@ data-ingest/
 │   └── retrieve.py              # Retrieval examples
 ├── tests/
 │   ├── conftest.py              # Test fixtures
-│   ├── test_embedding.py        # Unit tests
-│   ├── test_contextual_chunking.py
-│   ├── test_indexing.py
-│   ├── test_process_documents.py
+│   ├── test_*.py                # Unit tests
 │   └── test_integration.py      # Integration tests (real APIs)
 ├── dataset/
 │   ├── src/                     # Input: source documents
 │   ├── res/                     # Output: extracted JSON
 │   └── chunks/                  # Output: contextual chunks
-├── chunk_all_documents.sh       # Batch processing script
+├── Makefile                     # Pipeline commands
 ├── .env.example                 # Environment template
 └── pyproject.toml               # Dependencies
 ```
@@ -89,24 +89,17 @@ UNSTRUCTURED_API_URL=
 
 ## Usage
 
-### Process Documents
+### Pipeline Commands
 
 ```bash
-# Place documents in dataset/src/, then:
-uv run python -m src.process_documents
-```
-
-### Generate Chunks
-
-```bash
-# Single document
-uv run python -m src.contextual_chunking --single dataset/res/doc.json
-
-# All documents
-./chunk_all_documents.sh
-
-# Options
-uv run python -m src.contextual_chunking --help
+make help              # Show all commands
+make process           # Extract documents from dataset/src/
+make chunk             # Chunk all files in dataset/res/
+make chunk FILE=x.json # Chunk single file
+make index             # Index to Pinecone
+make pipeline          # Run full pipeline
+make stats             # Show index statistics
+make clean             # Remove generated files
 ```
 
 ### Index & Query
@@ -143,14 +136,10 @@ results = retriever.search_with_combined_filters(
 ## Testing
 
 ```bash
-# Install dev dependencies
-uv sync --extra dev
-
-# Run unit tests
-uv run pytest tests/
-
-# Run integration tests (uses real APIs)
-uv run pytest tests/ --run-integration
+make dev               # Install dev dependencies
+make test              # Run unit tests
+make test-integration  # Run integration tests (real APIs)
+make coverage          # Run tests with coverage report
 ```
 
 ## API Reference
